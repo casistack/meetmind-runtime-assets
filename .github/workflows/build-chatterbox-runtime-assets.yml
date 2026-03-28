@@ -34,7 +34,7 @@ jobs:
             ];
             const supported = {
               "linux-x86_64": { runner: "ubuntu-latest", pythonArchitecture: "x64" },
-              "macos-x86_64": { runner: "macos-13", pythonArchitecture: "x64" },
+              "macos-x86_64": { runner: "macos-15-intel", pythonArchitecture: "x64" },
               "macos-aarch64": { runner: "macos-14", pythonArchitecture: "arm64" },
               "windows-x86_64": { runner: "windows-latest", pythonArchitecture: "x64" },
             };
@@ -95,7 +95,12 @@ jobs:
           PY
             )"
           fi
-          echo "PYTHON_VERSION=${REQUESTED}" >> "$GITHUB_ENV"
+          SEMVER_REQUEST="${REQUESTED}"
+          if [[ "${REQUESTED}" =~ ^([0-9]+\.[0-9]+)\.[0-9]+$ ]]; then
+            SEMVER_REQUEST="${BASH_REMATCH[1]}"
+          fi
+          echo "PYTHON_VERSION=${SEMVER_REQUEST}" >> "$GITHUB_ENV"
+          echo "REQUESTED_PYTHON_VERSION=${REQUESTED}" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
