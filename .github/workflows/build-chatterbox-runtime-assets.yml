@@ -1,0 +1,175 @@
+name: Build Chatterbox Runtime Assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_version:
+        description: "Bundled Python version to stage (for example 3.10.19)"
+        required: true
+        type: string
+      platforms:
+        description: "Comma-separated platform keys (linux-x86_64, macos-x86_64, macos-aarch64, windows-x86_64)"
+        required: true
+        type: string
+        default: "macos-aarch64,macos-x86_64,windows-x86_64"
+  push:
+    branches:
+      - _runtime-assets-temp
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Build matrix
+        id: matrix
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const defaultPlatforms = [
+              "macos-aarch64",
+              "macos-x86_64",
+              "windows-x86_64",
+            ];
+            const supported = {
+              "linux-x86_64": { runner: "ubuntu-latest", pythonArchitecture: "x64" },
+              "macos-x86_64": { runner: "macos-13", pythonArchitecture: "x64" },
+              "macos-aarch64": { runner: "macos-14", pythonArchitecture: "arm64" },
+              "windows-x86_64": { runner: "windows-latest", pythonArchitecture: "x64" },
+            };
+
+            const raw = core.getInput("platforms");
+            const requested = (raw || defaultPlatforms.join(","))
+              .split(",")
+              .map((value) => value.trim())
+              .filter(Boolean);
+
+            if (requested.length === 0) {
+              core.setFailed("No runtime platforms were requested.");
+              return;
+            }
+
+            const unsupported = requested.filter((key) => !(key in supported));
+            if (unsupported.length > 0) {
+              core.setFailed(
+                `Unsupported platform keys: ${unsupported.join(", ")}. Supported keys: ${Object.keys(supported).join(", ")}`
+              );
+              return;
+            }
+
+            const matrix = requested.map((platformKey) => ({
+              platformKey,
+              runner: supported[platformKey].runner,
+              pythonArchitecture: supported[platformKey].pythonArchitecture,
+            }));
+
+            core.setOutput("matrix", JSON.stringify(matrix));
+
+  build-assets:
+    needs: prepare-matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      PLATFORM_KEY: ${{ matrix.platformKey }}
+      PYTHON_ARCHITECTURE: ${{ matrix.pythonArchitecture }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine Python version
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUESTED="${{ inputs.python_version }}"
+          if [[ -z "${REQUESTED}" ]]; then
+            REQUESTED="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path("src-tauri/resources/chatterbox-runtime/manifest.json").read_text())
+          print(manifest["pythonVersion"])
+          PY
+            )"
+          fi
+          echo "PYTHON_VERSION=${REQUESTED}" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ env.PYTHON_ARCHITECTURE }}
+
+      - name: Stage runtime assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          export STAGE_ROOT="$RUNNER_TEMP/chatterbox-runtime-stage"
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import sys
+
+          repo_root = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          stage_root = pathlib.Path(os.environ["STAGE_ROOT"])
+          platform_key = os.environ["PLATFORM_KEY"]
+          manifest_path = repo_root / "src-tauri" / "resources" / "chatterbox-runtime" / "manifest.json"
+
+          manifest = json.loads(manifest_path.read_text())
+          packages = manifest["packages"]
+
+          exe = pathlib.Path(sys.executable).resolve()
+          python_root = exe.parent if os.name == "nt" else exe.parent.parent
+
+          python_dest = stage_root / "python" / platform_key
+          wheelhouse_dest = stage_root / "wheelhouse" / platform_key
+          metadata_dest = stage_root / "metadata"
+
+          shutil.copytree(
+              python_root,
+              python_dest,
+              symlinks=True,
+              dirs_exist_ok=True,
+              ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+          )
+          wheelhouse_dest.mkdir(parents=True, exist_ok=True)
+          metadata_dest.mkdir(parents=True, exist_ok=True)
+
+          specs = [
+              f"chatterbox-tts=={packages['chatterboxTts']}",
+              f"fastapi=={packages['fastapi']}",
+              f"uvicorn=={packages['uvicorn']}",
+              f"numpy=={packages['numpy']}",
+          ]
+
+          subprocess.run(
+              [sys.executable, "-m", "pip", "download", "--dest", str(wheelhouse_dest), *specs],
+              check=True,
+          )
+
+          metadata = {
+              "platformKey": platform_key,
+              "pythonVersion": sys.version.split()[0],
+              "pythonExecutable": str(exe),
+              "pythonRoot": str(python_root),
+              "runnerOs": os.environ.get("RUNNER_OS"),
+              "runnerArch": os.environ.get("RUNNER_ARCH"),
+              "requestedPythonVersion": os.environ.get("PYTHON_VERSION"),
+              "packageVersions": packages,
+          }
+          (metadata_dest / f"{platform_key}.json").write_text(json.dumps(metadata, indent=2))
+          PY
+
+      - name: Upload runtime asset bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatterbox-runtime-${{ matrix.platformKey }}
+          path: ${{ runner.temp }}/chatterbox-runtime-stage/
+          retention-days: 1
+          if-no-files-found: error
